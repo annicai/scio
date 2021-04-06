@@ -16,6 +16,7 @@ Also check out the [SDK Version Support Status](https://cloud.google.com/dataflo
 
 | **Scio** | **SDK Dependency** | **Description**     |
 |:--------:|:------------------:|:--------------------|
+| 0.10.x   | Apache Beam 2.x.x  | Coder implicits, `scio-google-cloud-platform` |
 | 0.9.x    | Apache Beam 2.x.x  | Drop Scala 2.11, add Scala 2.13, Guava based Bloom Filter |
 | 0.8.x    | Apache Beam 2.x.x  | Beam SQL, BigQuery storage API, ScioExecutionContext, Async `DoFn`s |
 | 0.7.x    | Apache Beam 2.x.x  | Static coders, new ScioIO |
@@ -28,8 +29,9 @@ Also check out the [SDK Version Support Status](https://cloud.google.com/dataflo
 
 | **Scio Version** | **Beam Version** | **Details** |
 |:----------------:|:----------------:|:------------|
-| 0.9.4            | 2.24.0           | This version will be deprecated on September 18, 2021. |
-| 0.9.3            | 2.23.0           | This version will be deprecated on July 29, 2021. |
+| 0.10.0           | 2.28.0           | This version will be deprecated on February 22, 2022. |
+| 0.9.5            | 2.24.0           | This version will be deprecated on September 18, 2021. |
+| 0.9.3+           | 2.23.0           | This version will be deprecated on July 29, 2021. |
 | 0.9.2            | 2.22.0           | This version will be deprecated on June 8, 2021. |
 | 0.9.1            | 2.20.0           | This version will be deprecated on April 15, 2021. |
 | 0.9.0            | 2.20.0           |             |
@@ -66,17 +68,3 @@ For changes available in `latest` but not in `current`:
 For changes we want to make to `latest`:
 - Submit pull request to `latest`
 - Follow the steps above once merged
-
-## Beam master nightly build
-
-To keep up with upstream changes, [beam-master](https://github.com/spotify/scio/tree/beam-master) branch is built nightly and depends on latest Beam SNAPSHOT.
-
-We should do the following periodically to reduce work when upgrading Beam release version.
-- rebase `beam-master` on `master`
-- fix for breaking changes in `beam-master`
-- rebase `master` on `beam-master` when upgrading Beam release version.
-
-To work on a breaking change:
-- checkout `beam-master` branch
-- run `./scripts/circleci_snapshot.sh` to change `beamVersion` to the latest SNAPSHOT
-- run `sbt test it:test` and fix errors
