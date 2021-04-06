@@ -54,7 +54,7 @@ trait SCollectionSyntax {
     ): SCollection[((D, R), (M, Long))] = {
 
       val doubleCounting = self
-        .withName("RollupAndCountDuplicatesNoCoders")
+        .withName("NoCodersRollupAndCountDuplicates")
         .transform {
           _.map { case (_, dims, rollupDims, measure) =>
             ((dims, rollupDims), (measure, 1L))
