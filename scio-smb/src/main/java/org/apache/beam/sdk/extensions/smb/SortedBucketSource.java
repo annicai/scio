@@ -652,7 +652,8 @@ public abstract class SortedBucketSource<KeyType> extends BoundedSource<KV<KeyTy
       final int diskBufferMb = opts.getSortedBucketReadDiskBufferMb();
       FileOperations.setDiskBufferMb(diskBufferMb);
 
-      final List<Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>>> iterators = new ArrayList<>();
+      final List<java.util.concurrent.Callable<List<Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>>>>> tasks =
+          new ArrayList<>();
       sourceMetadata.mapping.forEach(
           (dir, value) -> {
             if (dirFilter != null && !dirFilter.contains(dir)) return;
@@ -662,24 +663,54 @@ public abstract class SortedBucketSource<KeyType> extends BoundedSource<KV<KeyTy
                 (keying == Keying.PRIMARY)
                     ? value.metadata::primaryComparableKeyBytes
                     : value.metadata::primaryAndSecondaryComparableKeyBytes;
+            final KV<String, FileOperations<V>> inputOps = getInputs().get(dir);
             for (int i = (bucketId % numBuckets); i < numBuckets; i += targetParallelism) {
               for (int j = 0; j < numShards; j++) {
                 ResourceId file =
                     value.fileAssignment.forBucket(BucketShardId.of(i, j), numBuckets, numShards);
-                try {
-                  Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>> iterator =
-                      Iterators.transform(
-                          getInputs().get(dir).getValue().iterator(file),
-                          v -> KV.of(keyFn.apply(v), v));
-                  Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>> out =
-                      (bufferSize > 0) ? new BufferedIterator<>(iterator, bufferSize) : iterator;
-                  iterators.add(out);
-                } catch (Exception e) {
-                  throw new RuntimeException(e);
-                }
+                final int bs = bufferSize;
+                tasks.add(
+                    () -> {
+                      Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>> iterator =
+                          Iterators.transform(
+                              inputOps.getValue().iterator(file),
+                              v -> KV.of(keyFn.apply(v), v));
+                      Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>> out =
+                          (bs > 0) ? new BufferedIterator<>(iterator, bs) : iterator;
+                      return Collections.singletonList(out);
+                    });
               }
             }
           });
+
+      final List<Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>>> iterators = new ArrayList<>();
+      if (tasks.size() <= 1) {
+        for (var task : tasks) {
+          try {
+            iterators.addAll(task.call());
+          } catch (Exception e) {
+            throw new RuntimeException(e);
+          }
+        }
+      } else {
+        final int parallelism = Math.min(tasks.size(), 32);
+        final java.util.concurrent.ExecutorService pool =
+            java.util.concurrent.Executors.newFixedThreadPool(parallelism);
+        try {
+          final List<java.util.concurrent.Future<List<Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>>>>> futures =
+              pool.invokeAll(tasks);
+          for (var future : futures) {
+            iterators.addAll(future.get());
+          }
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new RuntimeException("Interrupted while opening SMB files", e);
+        } catch (java.util.concurrent.ExecutionException e) {
+          throw new RuntimeException("Failed to open SMB file", e.getCause());
+        } finally {
+          pool.shutdown();
+        }
+      }
       return new KeyGroupIterator<>(iterators, keyComparator);
     }
 
