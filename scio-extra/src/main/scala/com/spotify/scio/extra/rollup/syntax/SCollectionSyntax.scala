@@ -129,44 +129,57 @@ trait SCollectionSyntax extends SortMergeBucketScioContextSyntax {
       targetParallelism: TargetParallelism = TargetParallelism.auto()
     )(implicit g: Group[M]): SCollection[((D, R), (M, Long))] = {
 
-      val grouped = self.sortMergeGroupByKey(keyClass, read, targetParallelism)
+      // Single flatMap consumes the lazy SMB iterable once via perKeyFn (which returns Seq).
+      // Emits tagged records: true = main (un-expanded), false = correction (already expanded).
+      val tagged = self
+        .sortMergeGroupByKey(keyClass, read, targetParallelism)
+        .withName("SortMergeRollupAndCount")
+        .flatMap { case (key, values) =>
+          val tuples = perKeyFn(key, values)
 
-      // Branch 1 (main): unchanged from rollupAndCount.
-      // Aggregate to metric level first, then expand rollups on the small result.
-      val main = grouped
+          val main = tuples.iterator.map { case (d, r, m) =>
+            (true, ((d, r), (m, 1L)))
+          }
+
+          val corrections = tuples
+            .groupBy(_._1)
+            .iterator
+            .flatMap { case (d, byD) =>
+              if (byD.size <= 1) Iterator.empty
+              else {
+                val rollupMap = collection.mutable.Map.empty[R, Long]
+                for ((_, r, _) <- byD; r2 <- rollupFunction(r)) {
+                  rollupMap(r2) = rollupMap.getOrElse(r2, 1L) - 1L
+                }
+                rollupMap.iterator.collect {
+                  case (r2, count) if count < 0L =>
+                    (false, ((d, r2), (g.zero, count)))
+                }
+              }
+            }
+
+          main ++ corrections
+        }
+
+      // Branch 1 (main): sum metric first (massive reduction), then expand rollups.
+      val main = tagged
         .withName("SortMergeRollupAndCountDuplicates")
         .transform {
-          _.flatMap { case (key, values) =>
-            perKeyFn(key, values).map { case (d, r, m) => ((d, r), (m, 1L)) }
-          }.sumByKey
+          _.filter(_._1)
+            .map(_._2)
+            .sumByKey
             .flatMap { case (dims @ (_, rollupDims), measure) =>
               rollupFunction(rollupDims)
                 .map((x: R) => dims.copy(_2 = x) -> measure)
             }
         }
 
-      // Branch 2 (correction): SMB-optimized — computed locally per key, no shuffle.
-      val corrections = grouped
+      // Branch 2 (correction): already in rolled-up space, no expansion needed.
+      val corrections = tagged
         .withName("SortMergeRollupAndCountCorrection")
         .transform {
-          _.flatMap { case (key, values) =>
-            val tuples = perKeyFn(key, values)
-            tuples
-              .groupBy(_._1)
-              .iterator
-              .flatMap { case (d, byD) =>
-                if (byD.size <= 1) Iterator.empty
-                else {
-                  val rollupMap = collection.mutable.Map.empty[R, Long]
-                  for ((_, r, _) <- byD; r2 <- rollupFunction(r)) {
-                    rollupMap(r2) = rollupMap.getOrElse(r2, 1L) - 1L
-                  }
-                  rollupMap.iterator.collect {
-                    case (r2, count) if count < 0L => ((d, r2), (g.zero, count))
-                  }
-                }
-              }
-          }
+          _.filter(!_._1)
+            .map(_._2)
         }
 
       SCollection
