@@ -1067,9 +1067,10 @@ lazy val `scio-extra` = project
   .enablePlugins(SbtAvro)
   .dependsOn(
     `scio-core` % "compile;provided->provided;test->test",
-    `scio-avro`,
+    `scio-avro` % "compile;test->test",
     `scio-google-cloud-platform`,
-    `scio-macros`
+    `scio-macros`,
+    `scio-smb` % "provided;test->test"
   )
   .settings(commonSettings)
   .settings(macroSettings)

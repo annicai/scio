@@ -105,6 +105,10 @@ public abstract class SortedBucketSource<KeyType> extends BoundedSource<KV<KeyTy
   protected SourceSpec sourceSpec;
   protected Long estimatedSizeBytes;
   protected final String metricsKey;
+  protected boolean lazyKeyGroups = false;
+  // When set, overrides the (bucketOffsetId, effectiveParallelism) bucket assignment.
+  // Used by splitAtFraction to create residual sources for a subset of buckets.
+  protected List<Integer> explicitBucketIds = null;
 
   public SortedBucketSource(List<BucketedInput<?>> sources) {
     this(sources, TargetParallelism.auto());
@@ -157,6 +161,27 @@ public abstract class SortedBucketSource<KeyType> extends BoundedSource<KV<KeyTy
       int splitNum, int totalParallelism, long estSplitSize);
 
   protected abstract Comparator<SortedBucketIO.ComparableKeyBytes> comparator();
+
+  /** Compute the list of bucket IDs assigned to this source. */
+  List<Integer> getAssignedBuckets() {
+    if (explicitBucketIds != null) return explicitBucketIds;
+    int numBuckets = getOrComputeSourceSpec().greatestNumBuckets;
+    List<Integer> buckets = new ArrayList<>();
+    for (int i = bucketOffsetId; i < numBuckets; i += effectiveParallelism) {
+      buckets.add(i);
+    }
+    return buckets;
+  }
+
+  /** Create a copy of this source for a specific set of bucket IDs. */
+  SortedBucketSource<KeyType> createSourceForBuckets(List<Integer> bucketIds, long estSize) {
+    // Use bucket 0 as dummy offset — explicitBucketIds overrides the assignment
+    SortedBucketSource<KeyType> copy =
+        createSplitSource(0, effectiveParallelism, estSize);
+    copy.lazyKeyGroups = this.lazyKeyGroups;
+    copy.explicitBucketIds = bucketIds;
+    return copy;
+  }
 
   private static String getDefaultMetricsKey() {
     return "SortedBucketSource{" + metricsId.getAndAdd(1) + "}";
@@ -221,7 +246,13 @@ public abstract class SortedBucketSource<KeyType> extends BoundedSource<KV<KeyTy
     final int totalParallelism = numSplits * effectiveParallelism;
     return IntStream.range(0, numSplits)
         .boxed()
-        .map(splitNum -> createSplitSource(splitNum, totalParallelism, estSplitSize))
+        .map(
+            splitNum -> {
+              SortedBucketSource<KeyType> split =
+                  createSplitSource(splitNum, totalParallelism, estSplitSize);
+              split.lazyKeyGroups = this.lazyKeyGroups;
+              return split;
+            })
         .collect(Collectors.toList());
   }
 
@@ -265,38 +296,109 @@ public abstract class SortedBucketSource<KeyType> extends BoundedSource<KV<KeyTy
   @Override
   public BoundedReader<KV<KeyType, CoGbkResult>> createReader(final PipelineOptions options)
       throws IOException {
-    // get any arbitrary metadata to be able to rehash keys into buckets
-    BucketMetadata<?, ?, ?> someArbitraryBucketMetadata =
-        sources.get(0).getSourceMetadata().mapping.values().stream().findAny().get().metadata;
-    return new MergeBucketsReader<>(
-        new MultiSourceKeyGroupReader<KeyType>(
-            sources,
-            toKeyFn(),
-            coGbkResultSchema(),
-            someArbitraryBucketMetadata,
-            comparator(),
-            metricsKey,
-            true,
-            bucketOffsetId,
-            effectiveParallelism,
-            options),
-        this);
+    return new MergeBucketsReader<>(this, options);
   }
 
-  /** Merge key-value groups in matching buckets. */
+  /**
+   * Merge key-value groups in matching buckets. Processes buckets sequentially (one at a time)
+   * to support dynamic work rebalancing via {@link #splitAtFraction}.
+   */
   static class MergeBucketsReader<KeyType> extends BoundedReader<KV<KeyType, CoGbkResult>> {
-    private final SortedBucketSource<KeyType> currentSource;
-    private final MultiSourceKeyGroupReader<KeyType> iter;
-    private KV<KeyType, CoGbkResult> next = null;
+    private final SortedBucketSource<KeyType> originalSource;
+    private final PipelineOptions options;
 
-    MergeBucketsReader(
-        MultiSourceKeyGroupReader<KeyType> iter, SortedBucketSource<KeyType> currentSource) {
-      this.currentSource = currentSource;
-      this.iter = iter;
+    // Synchronized state for splitAtFraction
+    private final Object splitLock = new Object();
+    private List<Integer> assignedBuckets;
+    private int currentBucketIdx = 0;
+
+    private MultiSourceKeyGroupReader<KeyType> currentReader;
+    private KV<KeyType, CoGbkResult> next = null;
+    private boolean started = false;
+
+    MergeBucketsReader(SortedBucketSource<KeyType> source, PipelineOptions options) {
+      this.originalSource = source;
+      this.options = options;
+      this.assignedBuckets = new ArrayList<>(source.getAssignedBuckets());
+      // Sequential bucket processing only works when all sources have the same bucket count.
+      // With mixed counts, fall back to processing all buckets in one merge-sort.
+      SourceSpec spec = source.getOrComputeSourceSpec();
+      this.sequentialMode = (spec.leastNumBuckets == spec.greatestNumBuckets);
+    }
+
+    private final boolean sequentialMode;
+
+    private MultiSourceKeyGroupReader<KeyType> createReaderForBucket(int bucketId) {
+      BucketMetadata<?, ?, ?> someArbitraryBucketMetadata =
+          originalSource.sources.get(0).getSourceMetadata().mapping.values().stream()
+              .findAny()
+              .get()
+              .metadata;
+      int numBuckets = originalSource.getOrComputeSourceSpec().greatestNumBuckets;
+      return new MultiSourceKeyGroupReader<KeyType>(
+          originalSource.sources,
+          originalSource.toKeyFn(),
+          originalSource.coGbkResultSchema(),
+          someArbitraryBucketMetadata,
+          originalSource.comparator(),
+          originalSource.metricsKey,
+          !originalSource.lazyKeyGroups,
+          bucketId,
+          numBuckets,
+          options);
+    }
+
+    private MultiSourceKeyGroupReader<KeyType> createReaderForAllBuckets() {
+      BucketMetadata<?, ?, ?> someArbitraryBucketMetadata =
+          originalSource.sources.get(0).getSourceMetadata().mapping.values().stream()
+              .findAny()
+              .get()
+              .metadata;
+      return new MultiSourceKeyGroupReader<KeyType>(
+          originalSource.sources,
+          originalSource.toKeyFn(),
+          originalSource.coGbkResultSchema(),
+          someArbitraryBucketMetadata,
+          originalSource.comparator(),
+          originalSource.metricsKey,
+          !originalSource.lazyKeyGroups,
+          originalSource.bucketOffsetId,
+          originalSource.effectiveParallelism,
+          options);
+    }
+
+    private boolean advanceToNextBucket() {
+      synchronized (splitLock) {
+        currentBucketIdx++;
+        if (currentBucketIdx >= assignedBuckets.size()) {
+          currentReader = null;
+          return false;
+        }
+      }
+      int bucketId;
+      synchronized (splitLock) {
+        bucketId = assignedBuckets.get(currentBucketIdx);
+      }
+      currentReader = createReaderForBucket(bucketId);
+      return true;
     }
 
     @Override
     public boolean start() throws IOException {
+      started = true;
+      if (sequentialMode) {
+        if (assignedBuckets.isEmpty()) return false;
+        synchronized (splitLock) {
+          currentBucketIdx = 0;
+        }
+        int bucketId;
+        synchronized (splitLock) {
+          bucketId = assignedBuckets.get(0);
+        }
+        currentReader = createReaderForBucket(bucketId);
+      } else {
+        currentReader = createReaderForAllBuckets();
+      }
       return advance();
     }
 
@@ -306,11 +408,64 @@ public abstract class SortedBucketSource<KeyType> extends BoundedSource<KV<KeyTy
       return next;
     }
 
-    @SuppressWarnings("unchecked")
     @Override
     public boolean advance() throws IOException {
-      next = iter.readNext();
-      return next != null;
+      if (sequentialMode) {
+        while (true) {
+          if (currentReader == null) return false;
+          next = currentReader.readNext();
+          if (next != null) return true;
+          if (!advanceToNextBucket()) return false;
+        }
+      } else {
+        if (currentReader == null) return false;
+        next = currentReader.readNext();
+        return next != null;
+      }
+    }
+
+    @Override
+    public Double getFractionConsumed() {
+      if (!sequentialMode) return null;
+      synchronized (splitLock) {
+        if (assignedBuckets.isEmpty()) return 1.0;
+        if (!started) return 0.0;
+        return (double) currentBucketIdx / assignedBuckets.size();
+      }
+    }
+
+    @Override
+    public BoundedSource<KV<KeyType, CoGbkResult>> splitAtFraction(double fraction) {
+      synchronized (splitLock) {
+        // Only support dynamic splitting when all sources have the same bucket count.
+        // Mixed bucket counts require rehashing across logical buckets, which makes
+        // sequential per-bucket processing produce duplicate or missing records.
+        SourceSpec spec = originalSource.getOrComputeSourceSpec();
+        if (spec.leastNumBuckets != spec.greatestNumBuckets) return null;
+
+        int remaining = assignedBuckets.size() - currentBucketIdx - 1;
+        if (remaining <= 0) return null;
+
+        int splitPoint = currentBucketIdx + 1 + (int) Math.floor(remaining * fraction);
+        if (splitPoint <= currentBucketIdx) return null;
+        if (splitPoint >= assignedBuckets.size()) return null;
+
+        // Residual: buckets from splitPoint onwards
+        List<Integer> residualBuckets =
+            new ArrayList<>(assignedBuckets.subList(splitPoint, assignedBuckets.size()));
+        // Primary: keep buckets up to splitPoint
+        assignedBuckets = new ArrayList<>(assignedBuckets.subList(0, splitPoint));
+
+        long estResidualSize =
+            originalSource.estimatedSizeBytes != null
+                ? (long)
+                    (originalSource.estimatedSizeBytes
+                        * ((double) residualBuckets.size()
+                            / (residualBuckets.size() + assignedBuckets.size())))
+                : 0L;
+
+        return originalSource.createSourceForBuckets(residualBuckets, estResidualSize);
+      }
     }
 
     @Override
@@ -318,7 +473,7 @@ public abstract class SortedBucketSource<KeyType> extends BoundedSource<KV<KeyTy
 
     @Override
     public BoundedSource<KV<KeyType, CoGbkResult>> getCurrentSource() {
-      return currentSource;
+      return originalSource;
     }
   }
 
@@ -419,6 +574,7 @@ public abstract class SortedBucketSource<KeyType> extends BoundedSource<KV<KeyTy
     protected Keying keying;
     // lazy, internal checks depend on what kind of iteration is requested
     protected transient SourceMetadata<V> sourceMetadata = null; // lazy
+    private int maxPartitionsPerBatch = 0;
 
     private transient Map<ResourceId, KV<String, FileOperations<V>>> inputs;
     private final Map<Integer, KV<String, FileOperations<V>>> fileOperationsEncoding;
@@ -535,6 +691,33 @@ public abstract class SortedBucketSource<KeyType> extends BoundedSource<KV<KeyTy
       return sampledSource.getValue().getCoder();
     }
 
+    public int getMaxPartitionsPerBatch() {
+      return maxPartitionsPerBatch;
+    }
+
+    public void setMaxPartitionsPerBatch(int max) {
+      this.maxPartitionsPerBatch = max;
+    }
+
+    public boolean needsBatching() {
+      return maxPartitionsPerBatch > 0
+          && getSourceMetadata().mapping.size() > maxPartitionsPerBatch;
+    }
+
+    public List<Set<ResourceId>> getDirectoryBatches() {
+      SourceMetadata<V> sm = getSourceMetadata();
+      List<ResourceId> allDirs = new ArrayList<>(sm.mapping.keySet());
+      if (!needsBatching()) {
+        return Collections.singletonList(new HashSet<>(allDirs));
+      }
+      List<Set<ResourceId>> batches = new ArrayList<>();
+      for (int i = 0; i < allDirs.size(); i += maxPartitionsPerBatch) {
+        batches.add(
+            new HashSet<>(allDirs.subList(i, Math.min(i + maxPartitionsPerBatch, allDirs.size()))));
+      }
+      return batches;
+    }
+
     static CoGbkResultSchema schemaOf(List<BucketedInput<?>> sources) {
       return CoGbkResultSchema.of(
           sources.stream().map(BucketedInput::getTupleTag).collect(Collectors.toList()));
@@ -601,6 +784,11 @@ public abstract class SortedBucketSource<KeyType> extends BoundedSource<KV<KeyTy
 
     public KeyGroupIterator<V> createIterator(
         int bucketId, int targetParallelism, PipelineOptions options) {
+      return createIterator(bucketId, targetParallelism, options, null);
+    }
+
+    public KeyGroupIterator<V> createIterator(
+        int bucketId, int targetParallelism, PipelineOptions options, Set<ResourceId> dirFilter) {
       SourceMetadata<V> sourceMetadata = getSourceMetadata();
       final Comparator<SortedBucketIO.ComparableKeyBytes> keyComparator =
           (keying == Keying.PRIMARY)
@@ -612,33 +800,65 @@ public abstract class SortedBucketSource<KeyType> extends BoundedSource<KV<KeyTy
       final int diskBufferMb = opts.getSortedBucketReadDiskBufferMb();
       FileOperations.setDiskBufferMb(diskBufferMb);
 
-      final List<Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>>> iterators = new ArrayList<>();
+      final List<java.util.concurrent.Callable<List<Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>>>>> tasks =
+          new ArrayList<>();
       sourceMetadata.mapping.forEach(
           (dir, value) -> {
+            if (dirFilter != null && !dirFilter.contains(dir)) return;
             final int numBuckets = value.metadata.getNumBuckets();
             final int numShards = value.metadata.getNumShards();
             final Function<V, SortedBucketIO.ComparableKeyBytes> keyFn =
                 (keying == Keying.PRIMARY)
                     ? value.metadata::primaryComparableKeyBytes
                     : value.metadata::primaryAndSecondaryComparableKeyBytes;
+            final KV<String, FileOperations<V>> inputOps = getInputs().get(dir);
             for (int i = (bucketId % numBuckets); i < numBuckets; i += targetParallelism) {
               for (int j = 0; j < numShards; j++) {
                 ResourceId file =
                     value.fileAssignment.forBucket(BucketShardId.of(i, j), numBuckets, numShards);
-                try {
-                  Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>> iterator =
-                      Iterators.transform(
-                          getInputs().get(dir).getValue().iterator(file),
-                          v -> KV.of(keyFn.apply(v), v));
-                  Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>> out =
-                      (bufferSize > 0) ? new BufferedIterator<>(iterator, bufferSize) : iterator;
-                  iterators.add(out);
-                } catch (Exception e) {
-                  throw new RuntimeException(e);
-                }
+                final int bs = bufferSize;
+                tasks.add(
+                    () -> {
+                      Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>> iterator =
+                          Iterators.transform(
+                              inputOps.getValue().iterator(file),
+                              v -> KV.of(keyFn.apply(v), v));
+                      Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>> out =
+                          (bs > 0) ? new BufferedIterator<>(iterator, bs) : iterator;
+                      return Collections.singletonList(out);
+                    });
               }
             }
           });
+
+      final List<Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>>> iterators = new ArrayList<>();
+      if (tasks.size() <= 1) {
+        for (var task : tasks) {
+          try {
+            iterators.addAll(task.call());
+          } catch (Exception e) {
+            throw new RuntimeException(e);
+          }
+        }
+      } else {
+        final int parallelism = Math.min(tasks.size(), 32);
+        final java.util.concurrent.ExecutorService pool =
+            java.util.concurrent.Executors.newFixedThreadPool(parallelism);
+        try {
+          final List<java.util.concurrent.Future<List<Iterator<KV<SortedBucketIO.ComparableKeyBytes, V>>>>> futures =
+              pool.invokeAll(tasks);
+          for (var future : futures) {
+            iterators.addAll(future.get());
+          }
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new RuntimeException("Interrupted while opening SMB files", e);
+        } catch (java.util.concurrent.ExecutionException e) {
+          throw new RuntimeException("Failed to open SMB file", e.getCause());
+        } finally {
+          pool.shutdown();
+        }
+      }
       return new KeyGroupIterator<>(iterators, keyComparator);
     }
 
