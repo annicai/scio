@@ -295,6 +295,7 @@ public abstract class SortedBucketSource<KeyType> extends BoundedSource<KV<KeyTy
     private final SortedBucketSource<KeyType> currentSource;
     private final MultiSourceKeyGroupReader<KeyType> iter;
     private KV<KeyType, CoGbkResult> next = null;
+    private long recordsEmitted = 0;
 
     MergeBucketsReader(
         MultiSourceKeyGroupReader<KeyType> iter, SortedBucketSource<KeyType> currentSource) {
@@ -317,7 +318,19 @@ public abstract class SortedBucketSource<KeyType> extends BoundedSource<KV<KeyTy
     @Override
     public boolean advance() throws IOException {
       next = iter.readNext();
+      if (next != null) recordsEmitted++;
       return next != null;
+    }
+
+    @Override
+    public Double getFractionConsumed() {
+      if (next == null && recordsEmitted > 0) return 1.0;
+      // Estimate based on split's estimated byte size and an assumed ~200 bytes per key group.
+      // An imprecise signal is better than null (unknown) for the autoscaler.
+      Long estBytes = currentSource.estimatedSizeBytes;
+      if (estBytes == null || estBytes <= 0) return null;
+      double estRecords = estBytes / 200.0;
+      return Math.min(recordsEmitted / estRecords, 0.99);
     }
 
     @Override
