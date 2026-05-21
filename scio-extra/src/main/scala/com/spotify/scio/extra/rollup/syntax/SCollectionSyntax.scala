@@ -133,8 +133,8 @@ trait SCollectionSyntax extends SortMergeBucketScioContextSyntax {
         .sortMergeGroupByKey(keyClass, read, targetParallelism)
         .withName("SortMergeRollupAndCount")
         .flatMap { case (key, values) =>
-          // Accumulate (D → (R → count)) for corrections — track distinct R values per D,
-          // counting duplicates so the correction logic handles repeated (D, R) tuples correctly.
+          // Accumulate (D → (R → count)) for corrections — track R occurrences per D
+          // so duplicates contribute proportionally to corrections.
           val correctionState =
             new collection.mutable.HashMap[D, collection.mutable.HashMap[R, Long]]()
 
@@ -148,18 +148,20 @@ trait SCollectionSyntax extends SortMergeBucketScioContextSyntax {
           }
 
           // Phase 2: after main iterator is exhausted, compute and yield corrections.
-          // Uses lazy iterator — corrections are computed on first access after main is done.
+          // Mirrors the original rollupAndCount correction logic: each occurrence of R
+          // decrements the rollup map by 1 (starting from 1), so n occurrences of the
+          // same R produce a net correction of -(n-1) for each rolled-up dimension.
           val correctionIter = new Iterator[(Boolean, ((D, R), (M, Long)))] {
             private var inner: Iterator[(Boolean, ((D, R), (M, Long)))] = _
 
             private def ensureInit(): Unit = {
               if (inner == null) {
                 inner = correctionState.iterator.flatMap { case (d, rCounts) =>
-                  // Only need corrections when there are multiple distinct R values per D
-                  if (rCounts.size <= 1) Iterator.empty
+                  val totalRecords = rCounts.values.sum
+                  if (totalRecords <= 1) Iterator.empty
                   else {
                     val rollupMap = collection.mutable.Map.empty[R, Long]
-                    for ((r, _) <- rCounts; r2 <- rollupFunction(r)) {
+                    for ((r, count) <- rCounts; _ <- 0L until count; r2 <- rollupFunction(r)) {
                       rollupMap(r2) = rollupMap.getOrElse(r2, 1L) - 1L
                     }
                     rollupMap.iterator.collect {
