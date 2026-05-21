@@ -105,17 +105,16 @@ trait SCollectionSyntax extends SortMergeBucketScioContextSyntax {
      * `sortMergeGroupByKey` already delivers all records per key to the same worker, so corrections
      * can be computed locally without a shuffle.
      *
-     * Emits tagged records from a single flatMap: main records (un-expanded) go through `sumByKey`
-     * then rollup expansion; correction records (already in rolled-up space) skip expansion and go
-     * directly to the final `sumByKey`.
+     * Streams through the lazy SMB iterable once per key. Main records are emitted as the iterator
+     * is consumed; only `(D -> List[R])` is accumulated in memory for computing corrections.
+     * After the iterator is exhausted, correction records are emitted.
      *
      * @param keyClass
      *   SMB key class (= unique key to count distinct, typically userId)
      * @param read
      *   SMB read configuration
-     * @param perKeyFn
-     *   per-key extraction function: given a key and all its records, produce `(D, R, M)` tuples.
-     *   The lazy SMB iterable is consumed once by this function.
+     * @param extractFn
+     *   per-record extraction function: given a key and one record, produce a `(D, R, M)` tuple
      * @param rollupFunction
      *   rollup expansion function (same as in [[RollupOps.rollupAndCount]])
      * @param targetParallelism
@@ -125,44 +124,54 @@ trait SCollectionSyntax extends SortMergeBucketScioContextSyntax {
     def sortMergeRollupAndCount[K: Coder, V: Coder, D: Coder, R: Coder, M: Coder](
       keyClass: Class[K],
       read: SortedBucketIO.Read[V],
-      perKeyFn: (K, Iterable[V]) => Seq[(D, R, M)],
+      extractFn: (K, V) => (D, R, M),
       rollupFunction: R => Set[R],
       targetParallelism: TargetParallelism = TargetParallelism.auto()
     )(implicit g: Group[M]): SCollection[((D, R), (M, Long))] = {
 
-      // Single flatMap consumes the lazy SMB iterable once via perKeyFn.
-      // Emits tagged records: true = main (un-expanded), false = correction (already expanded).
       val tagged = self
         .sortMergeGroupByKey(keyClass, read, targetParallelism)
         .withName("SortMergeRollupAndCount")
         .flatMap { case (key, values) =>
-          val tuples = perKeyFn(key, values)
+          // Accumulate only (D → List[R]) for corrections — measures not needed (g.zero)
+          val correctionState = new collection.mutable.HashMap[D, collection.mutable.ArrayBuffer[R]]()
 
-          // Main: un-expanded (D, R) with measure and userCount=1
-          val main = tuples.iterator.map { case (d, r, m) =>
+          // Phase 1: stream through lazy iterator, yield main records one at a time.
+          // Side-effect: accumulate R values per D for correction computation.
+          val mainIter = values.iterator.map { v =>
+            val (d, r, m) = extractFn(key, v)
+            correctionState.getOrElseUpdate(d, new collection.mutable.ArrayBuffer[R]()) += r
             (true, ((d, r), (m, 1L)))
           }
 
-          // Correction: group by D locally (no shuffle), compute corrections
-          // in rolled-up R space for users with multiple R values per D
-          val corrections = tuples
-            .groupBy(_._1)
-            .iterator
-            .flatMap { case (d, byD) =>
-              if (byD.size <= 1) Iterator.empty
-              else {
-                val rollupMap = collection.mutable.Map.empty[R, Long]
-                for ((_, r, _) <- byD; r2 <- rollupFunction(r)) {
-                  rollupMap(r2) = rollupMap.getOrElse(r2, 1L) - 1L
-                }
-                rollupMap.iterator.collect {
-                  case (r2, count) if count < 0L =>
-                    (false, ((d, r2), (g.zero, count)))
+          // Phase 2: after main iterator is exhausted, compute and yield corrections.
+          // Uses lazy iterator — corrections are computed on first access after main is done.
+          val correctionIter = new Iterator[(Boolean, ((D, R), (M, Long)))] {
+            private var inner: Iterator[(Boolean, ((D, R), (M, Long)))] = _
+
+            private def ensureInit(): Unit = {
+              if (inner == null) {
+                inner = correctionState.iterator.flatMap { case (d, rs) =>
+                  if (rs.size <= 1) Iterator.empty
+                  else {
+                    val rollupMap = collection.mutable.Map.empty[R, Long]
+                    for (r <- rs; r2 <- rollupFunction(r)) {
+                      rollupMap(r2) = rollupMap.getOrElse(r2, 1L) - 1L
+                    }
+                    rollupMap.iterator.collect {
+                      case (r2, count) if count < 0L =>
+                        (false, ((d, r2), (g.zero, count)))
+                    }
+                  }
                 }
               }
             }
 
-          main ++ corrections
+            override def hasNext: Boolean = { ensureInit(); inner.hasNext }
+            override def next(): (Boolean, ((D, R), (M, Long))) = { ensureInit(); inner.next() }
+          }
+
+          mainIter ++ correctionIter
         }
 
       // Branch 1 (main): sum metric first (massive reduction), then expand rollups.

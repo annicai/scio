@@ -43,17 +43,15 @@ object SortMergeRollupTest {
       .read(new TupleTag[Account]("accounts"), classOf[Account])
       .from(path)
 
-  def perKeyFn(
+  def extractFn(
     @annotation.unused key: Integer,
-    accounts: Iterable[Account]
-  ): Seq[(String, RollupDims, Measure)] =
-    accounts.map { a =>
-      (
-        a.getName.toString,
-        RollupDims(accountType = Some(a.getType.toString)),
-        Measure(a.getAmount.toLong)
-      )
-    }.toSeq
+    a: Account
+  ): (String, RollupDims, Measure) =
+    (
+      a.getName.toString,
+      RollupDims(accountType = Some(a.getType.toString)),
+      Measure(a.getAmount.toLong)
+    )
 
   def mkAccount(id: Int, tpe: String, name: String, amount: Double): Account =
     Account
@@ -75,7 +73,7 @@ object SortMergeRollupJob {
     sc.sortMergeRollupAndCount(
       classOf[Integer],
       avroRead(args("input")),
-      perKeyFn,
+      extractFn,
       groupingSets
     ).map { case ((name, dims), (measure, count)) =>
         s"$name|${dims.accountType.getOrElse("ALL")}|${measure.amount}|$count"
